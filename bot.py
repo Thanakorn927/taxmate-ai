@@ -294,6 +294,25 @@ async def export_command(interaction: discord.Interaction):
         file=file,
         ephemeral=True
     )
+
+@bot.tree.command(name="dashboard", description="เปิดหน้าเว็บ Dashboard สรุปค่าใช้จ่ายและภาษี")
+async def dashboard_command(interaction: discord.Interaction):
+    dashboard_url = "https://taxmate-ai-u9yickkxqksgrh7hzuduqt.streamlit.app/"  
+    embed = discord.Embed(
+        title="📊 TaxMate AI Web Dashboard",
+        description="คลิกปุ่มด้านล่างเพื่อดูกราฟสรุปค่าใช้จ่าย สัดส่วนหมวดหมู่ ยอดลดหย่อนภาษี และเปิดดูรูปสลิปย้อนหลังทั้งหมดครับ",
+        color=discord.Color.blue()
+    )
+
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="เปิดหน้าเว็บ Dashboard",
+        style=discord.ButtonStyle.link,
+        url=dashboard_url,
+        emoji="🌐"
+    ))
+
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
