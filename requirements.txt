@@ -4,3 +4,6 @@ python-dotenv
 pillow
 pydantic
 supabase
+streamlit
+pandas
+plotly
