@@ -187,9 +187,14 @@ class ConfirmView(discord.ui.View):
                 }).eq("id", self.matched_receipt_id).execute()
                 footer_text = "🔗 จับคู่และอัปเกรดสิทธิ์ลดหย่อนภาษีเรียบร้อยแล้ว! (ไม่นับยอดเบิ้ล)"
             else:
+                # เช็กว่าห้องนี้เป็น Shared Workspace หรือไม่
+                ws_res = supabase.table("workspaces").select("id").eq("discord_channel_id", str(interaction.channel_id)).limit(1).execute()
+                workspace_id = ws_res.data[0]["id"] if ws_res.data else None
+
                 record = {
                     "discord_user_id": str(self.author_id),
                     "discord_channel_id": str(interaction.channel_id),
+                    "workspace_id": workspace_id,
                     "image_hash": self.file_hash,
                     "image_url": file_url,
                     "doc_type": self.receipt_data["doc_type"],
@@ -579,6 +584,149 @@ async def monthly_report_command(interaction: discord.Interaction, month: str = 
         return
 
     embed = build_monthly_embed(target_month, res.data)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    # --- เฟส 2: Shared Workspace และโหมดหารบิล ---
+
+class SplitBillView(discord.ui.View):
+    def __init__(self, split_records: list, payer_id: int, note: str, per_person: float):
+        super().__init__(timeout=None)
+        self.split_records = split_records  # list of {"id": ..., "debtor_id": ...}
+        self.payer_id = payer_id
+        self.note = note
+        self.per_person = per_person
+
+    @discord.ui.button(label="จ่ายคืนแล้ว", style=discord.ButtonStyle.green, emoji="💸")
+    async def mark_paid_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = str(interaction.user.id)
+        target = next((r for r in self.split_records if r["debtor_id"] == user_id), None)
+
+        if not target:
+            await interaction.response.send_message("⚠️ คุณไม่มีชื่อในรายการหารบิลนี้ครับ", ephemeral=True)
+            return
+
+        supabase.table("bill_splits").update({"is_paid": True}).eq("id", target["id"]).execute()
+        await interaction.response.send_message(
+            f"✅ <@{user_id}> จ่ายคืนค่า **{self.note}** จำนวน **{self.per_person:,.2f} บาท** ให้ <@{self.payer_id}> เรียบร้อยแล้ว!"
+        )
+
+@bot.tree.command(name="workspace_create", description="สร้างห้องกองกลาง (Shared Workspace) ในห้องแชทนี้")
+@app_commands.describe(name="ชื่อกลุ่ม เช่น กองกลางหอพัก, ทริปเที่ยว, ค่าใช้จ่ายครอบครัว")
+async def workspace_create_command(interaction: discord.Interaction, name: str):
+    await interaction.response.defer()
+    user_id = str(interaction.user.id)
+    channel_id = str(interaction.channel_id)
+
+    # บันทึกผู้ใช้ลงตาราง users (ถ้ายังไม่มี)
+    supabase.table("users").upsert({
+        "discord_user_id": user_id,
+        "display_name": interaction.user.display_name
+    }).execute()
+
+    # เช็กว่าห้องนี้สร้าง Workspace ไปแล้วหรือยัง
+    existing = supabase.table("workspaces").select("id, name").eq("discord_channel_id", channel_id).execute()
+    if existing.data:
+        await interaction.followup.send(f"⚠️ ห้องนี้ถูกตั้งเป็น Workspace ชื่อ **{existing.data[0]['name']}** อยู่แล้วครับ")
+        return
+
+    ws = supabase.table("workspaces").insert({
+        "name": name.strip(),
+        "discord_channel_id": channel_id,
+        "owner_id": user_id
+    }).execute()
+
+    workspace_id = ws.data[0]["id"]
+    supabase.table("workspace_members").insert({
+        "workspace_id": workspace_id,
+        "discord_user_id": user_id,
+        "role": "owner"
+    }).execute()
+
+    embed = discord.Embed(
+        title=f"🏠 สร้าง Shared Workspace: {name}",
+        description="ตั้งค่าห้องนี้เป็น **พื้นที่กองกลาง** เรียบร้อยแล้ว!\nบิลและสลิปทุกใบที่ส่งในห้องนี้จะถูกจัดกลุ่มรวมกันอัตโนมัติครับ",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="👑 ผู้ดูแลห้อง", value=f"<@{user_id}>", inline=True)
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="split", description="โหมดหารบิลและแชร์ค่าใช้จ่ายกับเพื่อน/ครอบครัว")
+@app_commands.describe(
+    total_amount="ยอดเงินรวมทั้งหมด (บาท)",
+    note="ชื่อรายการ เช่น ค่าหมูกระทะ, ค่าห้อง, ค่าน้ำมัน",
+    member1="คนที่ 1 ที่ร่วมหาร",
+    member2="คนที่ 2 ที่ร่วมหาร (ถ้ามี)",
+    member3="คนที่ 3 ที่ร่วมหาร (ถ้ามี)",
+    member4="คนที่ 4 ที่ร่วมหาร (ถ้ามี)",
+    include_self="รวมตัวคุณเองในการหารด้วยหรือไม่ (ค่าเริ่มต้น: รวม)"
+)
+async def split_command(
+    interaction: discord.Interaction,
+    total_amount: float,
+    note: str,
+    member1: discord.Member,
+    member2: discord.Member = None,
+    member3: discord.Member = None,
+    member4: discord.Member = None,
+    include_self: bool = True
+):
+    await interaction.response.defer()
+    debtors = [m for m in [member1, member2, member3, member4] if m is not None and m.id != interaction.user.id]
+    # ตัดชื่อซ้ำออก
+    unique_debtors = list({m.id: m for m in debtors}.values())
+
+    if not unique_debtors:
+        await interaction.followup.send("❌ กรุณาแท็กเพื่อนอย่างน้อย 1 คน (ที่ไม่ใช่ตัวเอง) ครับ", ephemeral=True)
+        return
+
+    total_people = len(unique_debtors) + (1 if include_self else 0)
+    per_person = round(total_amount / total_people, 2)
+
+    split_records = []
+    for member in unique_debtors:
+        res = supabase.table("bill_splits").insert({
+            "payer_id": str(interaction.user.id),
+            "debtor_id": str(member.id),
+            "amount": per_person,
+            "is_paid": False
+        }).execute()
+        split_records.append({"id": res.data[0]["id"], "debtor_id": str(member.id)})
+
+    mentions = " ".join([m.mention for m in unique_debtors])
+    embed = discord.Embed(title=f"🧾 หารบิล: {note}", color=discord.Color.gold())
+    embed.add_field(name="💰 ยอดรวมทั้งหมด", value=f"{total_amount:,.2f} บาท", inline=True)
+    embed.add_field(name="👥 หารกัน", value=f"{total_people} คน", inline=True)
+    embed.add_field(name="💸 ตกคนละ", value=f"**{per_person:,.2f} บาท**", inline=True)
+    embed.add_field(name="💳 โอนคืนให้", value=interaction.user.mention, inline=True)
+    embed.add_field(name="📌 รายชื่อผู้ต้องจ่าย", value=mentions, inline=False)
+    embed.set_footer(text="เมื่อโอนคืนแล้ว สามารถกดปุ่ม [💸 จ่ายคืนแล้ว] ด้านล่างเพื่ออัปเดตสถานะได้เลย")
+
+    view = SplitBillView(split_records, interaction.user.id, note, per_person)
+    await interaction.followup.send(content=mentions, embed=embed, view=view)
+
+@bot.tree.command(name="debts", description="เช็กยอดหารบิลที่ค้างจ่าย (ใครติดเงินเรา / เราติดเงินใคร)")
+async def debts_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    user_id = str(interaction.user.id)
+
+    # ยอดที่คนอื่นติดเรา
+    owed_to_me = supabase.table("bill_splits").select("*").eq("payer_id", user_id).eq("is_paid", False).execute().data
+    # ยอดที่เราติดคนอื่น
+    i_owe = supabase.table("bill_splits").select("*").eq("debtor_id", user_id).eq("is_paid", False).execute().data
+
+    embed = discord.Embed(title="💳 สรุปยอดหารบิลค้างจ่าย", color=discord.Color.teal())
+
+    if owed_to_me:
+        lines = [f"• <@{r['debtor_id']}> ค้างคุณ **{float(r['amount']):,.2f} บาท**" for r in owed_to_me]
+        embed.add_field(name="📥 ยอดที่เพื่อนค้างจ่ายคุณ", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="📥 ยอดที่เพื่อนค้างจ่ายคุณ", value="ไม่มีรายการค้าง", inline=False)
+
+    if i_owe:
+        lines = [f"• คุณค้าง <@{r['payer_id']}> **{float(r['amount']):,.2f} บาท**" for r in i_owe]
+        embed.add_field(name="📤 ยอดที่คุณค้างจ่ายเพื่อน", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="📤 ยอดที่คุณค้างจ่ายเพื่อน", value="ไม่มีรายการค้าง", inline=False)
+
     await interaction.followup.send(embed=embed, ephemeral=True)
 @bot.event
 async def on_message(message):
