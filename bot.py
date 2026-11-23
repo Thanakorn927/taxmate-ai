@@ -8,10 +8,9 @@ import asyncio
 import zipfile
 import aiohttp
 from datetime import datetime, time, timezone, timedelta
-from discord.ext import commands, tasks  # ⬅️ แก้บรรทัดเดิมให้เพิ่ม , tasks
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from PIL import Image
 from google import genai
@@ -38,6 +37,7 @@ class ReceiptData(BaseModel):
     category: str = Field(description="หมวดหมู่ค่าใช้จ่าย เช่น อาหารและเครื่องดื่ม, เดินทาง, ช้อปปิ้ง, สาธารณูปโภค, บริจาค")
     is_tax_deductible: bool = Field(description="มีสิทธิ์ลดหย่อนภาษีหรือไม่ (True/False)")
     confidence_score: int = Field(description="คะแนนความมั่นใจในการอ่านตัวเลข 0-100")
+    math_verified: bool = Field(description="ตรวจสอบยอดรวมคณิตศาสตร์บนบิลว่าถูกต้องหรือไม่ (ถ้าไม่มีรายการย่อยให้เป็น True)")
 
 # ฟังก์ชันบีบอัดรูปภาพ
 def compress_image(image_bytes: bytes) -> bytes:
@@ -50,17 +50,30 @@ def compress_image(image_bytes: bytes) -> bytes:
     return output.getvalue()
 
 # ฟังก์ชันสร้างกล่อง Embed แสดงผล
-def build_receipt_embed(data: dict) -> discord.Embed:
+def build_receipt_embed(data: dict, matched_merchant: str = None) -> discord.Embed:
     color = discord.Color.green() if data["confidence_score"] >= 80 else discord.Color.orange()
+    if not data.get("math_verified", True):
+        color = discord.Color.red()
+
     embed = discord.Embed(title=f"📄 ผลการอ่าน: {data['doc_type']}", color=color)
     embed.add_field(name="🏪 ร้านค้า / ผู้รับ", value=data["merchant_name"], inline=True)
     embed.add_field(name="💰 ยอดเงิน", value=f"{data['total_amount']:,.2f} บาท", inline=True)
     embed.add_field(name="📅 วันที่", value=data["date"], inline=True)
     embed.add_field(name="📁 หมวดหมู่", value=data["category"], inline=True)
     embed.add_field(name="🧾 ลดหย่อนภาษี", value="✅ ได้" if data["is_tax_deductible"] else "❌ ไม่ได้", inline=True)
+    embed.add_field(name="🧮 ตรวจยอดคณิต", value="✅ ถูกต้อง" if data.get("math_verified", True) else "⚠️ ยอดรวมไม่ตรง!", inline=True)
     embed.add_field(name="🎯 ความมั่นใจ AI", value=f"{data['confidence_score']}%", inline=True)
 
-    if data["confidence_score"] < 80:
+    if matched_merchant:
+        embed.add_field(
+            name="🔗 พบสลิปเดิมที่ตรงกัน!",
+            value=f"พบรายการ **{matched_merchant}** วันที่และยอดเงินตรงกัน\nกดปุ่มด้านล่างเพื่อ **อัปเกรดสิทธิ์ลดหย่อนภาษี** (ไม่นับยอดเบิ้ล)",
+            inline=False
+        )
+
+    if not data.get("math_verified", True):
+        embed.set_footer(text="⚠️ ตรวจพบยอดรวมคณิตศาสตร์บนบิลไม่ตรงกัน กรุณากดแก้ไขหรือตรวจสอบก่อนบันทึก")
+    elif data["confidence_score"] < 80:
         embed.set_footer(text="⚠️ บิลนี้ค่อนข้างจางหรืออ่านยาก กรุณาตรวจสอบหรือกดแก้ไขก่อนบันทึก")
     else:
         embed.set_footer(text="ตรวจสอบความถูกต้อง กดแก้ไขหรือยืนยันเพื่อบันทึกลงระบบ")
@@ -116,7 +129,8 @@ class EditReceiptModal(discord.ui.Modal, title="✏️ แก้ไขข้อ�
                 "date": self.date_input.value.strip(),
                 "category": self.category_input.value.strip(),
                 "is_tax_deductible": is_deductible,
-                "confidence_score": 100  # ผู้ใช้ตรวจสอบเองแล้ว
+                "confidence_score": 100,
+                "math_verified": True
             })
 
             updated_embed = build_receipt_embed(self.parent_view.receipt_data)
@@ -127,13 +141,19 @@ class EditReceiptModal(discord.ui.Modal, title="✏️ แก้ไขข้อ�
 
 # 4. ปุ่มควบคุมใต้กล่อง Embed
 class ConfirmView(discord.ui.View):
-    def __init__(self, author_id: int, receipt_data: dict, file_hash: str, file_bytes: bytes, is_pdf: bool):
+    def __init__(self, author_id: int, receipt_data: dict, file_hash: str, file_bytes: bytes, is_pdf: bool, matched_receipt_id: str = None):
         super().__init__(timeout=300)
         self.author_id = author_id
         self.receipt_data = receipt_data
         self.file_hash = file_hash
         self.file_bytes = file_bytes
         self.is_pdf = is_pdf
+        self.matched_receipt_id = matched_receipt_id
+
+        # ถ้าเจอสลิปเดิมให้เปลี่ยนข้อความปุ่มยืนยัน
+        if self.matched_receipt_id:
+            self.confirm_button.label = "จับคู่อัปเกรดสิทธิ์ภาษี"
+            self.confirm_button.emoji = "🔗"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -157,25 +177,38 @@ class ConfirmView(discord.ui.View):
             )
             file_url = supabase.storage.from_("receipts").get_public_url(file_path)
 
-            record = {
-                "discord_user_id": str(self.author_id),
-                "image_hash": self.file_hash,
-                "image_url": file_url,
-                "doc_type": self.receipt_data["doc_type"],
-                "merchant_name": self.receipt_data["merchant_name"],
-                "transaction_date": self.receipt_data["date"],
-                "total_amount": self.receipt_data["total_amount"],
-                "category": self.receipt_data["category"],
-                "is_tax_deductible": self.receipt_data["is_tax_deductible"],
-                "confidence_score": self.receipt_data["confidence_score"],
-            }
-            supabase.table("receipts").insert(record).execute()
+            if self.matched_receipt_id:
+                # อัปเกรดบิลเดิมแทนการเพิ่มแถวใหม่ (ไม่นับยอดเบิ้ล)
+                supabase.table("receipts").update({
+                    "is_tax_deductible": True,
+                    "doc_type": self.receipt_data["doc_type"],
+                    "matched_tax_url": file_url,
+                    "math_verified": self.receipt_data.get("math_verified", True)
+                }).eq("id", self.matched_receipt_id).execute()
+                footer_text = "🔗 จับคู่และอัปเกรดสิทธิ์ลดหย่อนภาษีเรียบร้อยแล้ว! (ไม่นับยอดเบิ้ล)"
+            else:
+                record = {
+                    "discord_user_id": str(self.author_id),
+                    "discord_channel_id": str(interaction.channel_id),
+                    "image_hash": self.file_hash,
+                    "image_url": file_url,
+                    "doc_type": self.receipt_data["doc_type"],
+                    "merchant_name": self.receipt_data["merchant_name"],
+                    "transaction_date": self.receipt_data["date"],
+                    "total_amount": self.receipt_data["total_amount"],
+                    "category": self.receipt_data["category"],
+                    "is_tax_deductible": self.receipt_data["is_tax_deductible"],
+                    "confidence_score": self.receipt_data["confidence_score"],
+                    "math_verified": self.receipt_data.get("math_verified", True),
+                }
+                supabase.table("receipts").insert(record).execute()
+                footer_text = "✅ บันทึกลงฐานข้อมูลเรียบร้อยแล้ว!"
 
             for item in self.children:
                 item.disabled = True
             embed = interaction.message.embeds[0]
             embed.color = discord.Color.blue()
-            embed.set_footer(text="✅ บันทึกลงฐานข้อมูลเรียบร้อยแล้ว!")
+            embed.set_footer(text=footer_text)
             await interaction.edit_original_response(embed=embed, view=self)
         except Exception as e:
             await interaction.followup.send(f"❌ บันทึกข้อมูลไม่สำเร็จ: {e}", ephemeral=True)
@@ -205,7 +238,6 @@ async def on_ready():
         check_recurring_bills.start()
     print(f"✅ บอท {bot.user} ออนไลน์แล้ว!")
 
-
 @bot.tree.command(name="summary", description="สรุปยอดค่าใช้จ่ายและรายการลดหย่อนภาษีของคุณ")
 async def summary_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -227,7 +259,6 @@ async def summary_command(interaction: discord.Interaction):
     total_spent = sum(float(r["total_amount"]) for r in records)
     total_tax = sum(float(r["total_amount"]) for r in records if r["is_tax_deductible"])
 
-    # รวมยอดแยกตามหมวดหมู่
     by_category = {}
     for r in records:
         cat = r["category"] or "อื่นๆ"
@@ -247,6 +278,7 @@ async def summary_command(interaction: discord.Interaction):
     embed.set_footer(text="🧾 = รายการที่สามารถใช้ลดหย่อนภาษีได้")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="export", description="ส่งออกรายการค่าใช้จ่ายทั้งหมดเป็นไฟล์ CSV (เปิดใน Excel ได้)")
 async def export_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -265,11 +297,8 @@ async def export_command(interaction: discord.Interaction):
         await interaction.followup.send("📭 ยังไม่พบข้อมูลบิลของคุณในระบบครับ", ephemeral=True)
         return
 
-    # สร้างไฟล์ CSV ในหน่วยความจำ
     output = io.StringIO()
     writer = csv.writer(output)
-
-    # เขียนหัวตาราง (Header)
     writer.writerow([
         "วันที่ทำรายการ",
         "ประเภทเอกสาร",
@@ -280,7 +309,6 @@ async def export_command(interaction: discord.Interaction):
         "ลิงก์เอกสารต้นฉบับ"
     ])
 
-    # เขียนข้อมูลแต่ละแถว
     for r in records:
         writer.writerow([
             r.get("transaction_date", ""),
@@ -289,10 +317,9 @@ async def export_command(interaction: discord.Interaction):
             r.get("category", ""),
             f"{float(r.get('total_amount', 0)):.2f}",
             "ได้" if r.get("is_tax_deductible") else "ไม่ได้",
-            r.get("image_url", "")
+            r.get("matched_tax_url") or r.get("image_url", "")
         ])
 
-    # แปลงเป็น Bytes แบบ utf-8-sig เพื่อให้ Excel อ่านภาษาไทยได้สมบูรณ์
     csv_bytes = io.BytesIO(output.getvalue().encode("utf-8-sig"))
     file = discord.File(fp=csv_bytes, filename=f"TaxMate_Export_{user_id}.csv")
 
@@ -304,7 +331,7 @@ async def export_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="dashboard", description="เปิดหน้าเว็บ Dashboard สรุปค่าใช้จ่ายและภาษี")
 async def dashboard_command(interaction: discord.Interaction):
-    dashboard_url = "https://taxmate-ai-u9yickkxqksgrh7hzuduqt.streamlit.app/"  
+    dashboard_url = "https://taxmate-ai-u9yickkxqksgrh7hzuduqt.streamlit.app/"
     embed = discord.Embed(
         title="📊 TaxMate AI Web Dashboard",
         description="คลิกปุ่มด้านล่างเพื่อดูกราฟสรุปค่าใช้จ่าย สัดส่วนหมวดหมู่ ยอดลดหย่อนภาษี และเปิดดูรูปสลิปย้อนหลังทั้งหมดครับ",
@@ -320,7 +347,8 @@ async def dashboard_command(interaction: discord.Interaction):
     ))
 
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-    # --- 1. คำสั่งตั้งค่าแจ้งเตือนบิลประจำ (/remind) ---
+
+# --- 1. คำสั่งตั้งค่าแจ้งเตือนบิลประจำ (/remind) ---
 @bot.tree.command(name="remind", description="ตั้งค่าแจ้งเตือนค่าใช้จ่ายประจำทุกเดือน (เช่น ค่าหอ ค่าเน็ต)")
 @app_commands.describe(
     bill_name="ชื่อรายการ เช่น ค่าหอ, ค่าเน็ต, ค่าบัตรเครดิต",
@@ -426,7 +454,7 @@ async def export_zip_command(interaction: discord.Interaction):
 
     res = (
         supabase.table("receipts")
-        .select("transaction_date, merchant_name, total_amount, image_url")
+        .select("transaction_date, merchant_name, total_amount, image_url, matched_tax_url")
         .eq("discord_user_id", user_id)
         .eq("is_tax_deductible", True)
         .order("transaction_date", desc=True)
@@ -442,7 +470,7 @@ async def export_zip_command(interaction: discord.Interaction):
     async with aiohttp.ClientSession() as session:
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for idx, r in enumerate(records, start=1):
-                url = r.get("image_url")
+                url = r.get("matched_tax_url") or r.get("image_url")
                 if not url:
                     continue
                 try:
@@ -463,6 +491,7 @@ async def export_zip_command(interaction: discord.Interaction):
         file=file,
         ephemeral=True
     )
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -488,6 +517,7 @@ async def on_message(message):
                     prompt = (
                         "วิเคราะห์เอกสารทางการเงินนี้ สกัดข้อมูลให้ถูกต้องตามโครงสร้าง "
                         "หากเป็นใบกำกับภาษีเต็มรูป e-Tax Invoice หรือ e-Donation ให้ตั้งค่า is_tax_deductible เป็น True "
+                        "ตรวจสอบผลรวมคณิตศาสตร์ของรายการสินค้า/VAT/ส่วนลดกับยอดสุทธิ หากไม่ตรงให้ตั้ง math_verified เป็น False "
                         "หากตัวเลขจางหรืออ่านยากให้ลดคะแนน confidence_score ตามความเป็นจริง"
                     )
 
@@ -497,8 +527,9 @@ async def on_message(message):
                     else:
                         upload_bytes = compress_image(raw_bytes)
                         ai_input = Image.open(io.BytesIO(upload_bytes))
+
                     response = None
-                    wait_times = [3, 8]  # หน่วงเวลารอเพิ่มขึ้นตามลำดับ
+                    wait_times = [3, 8]
 
                     for attempt in range(len(wait_times) + 1):
                         try:
@@ -522,14 +553,35 @@ async def on_message(message):
                                 await asyncio.sleep(delay)
                             else:
                                 raise api_err
+
                     data = json.loads(response.text)
-                    embed = build_receipt_embed(data)
+
+                    # ตรวจสอบว่ามีสลิปเดิมที่วันและยอดเงินตรงกันหรือไม่ (กรณีส่งใบกำกับภาษีตามมาทีหลัง)
+                    matched_receipt_id = None
+                    matched_merchant = None
+                    if data.get("is_tax_deductible"):
+                        match_res = (
+                            supabase.table("receipts")
+                            .select("id, merchant_name")
+                            .eq("discord_user_id", str(message.author.id))
+                            .eq("transaction_date", data["date"])
+                            .eq("total_amount", data["total_amount"])
+                            .eq("is_tax_deductible", False)
+                            .limit(1)
+                            .execute()
+                        )
+                        if match_res.data:
+                            matched_receipt_id = match_res.data[0]["id"]
+                            matched_merchant = match_res.data[0]["merchant_name"]
+
+                    embed = build_receipt_embed(data, matched_merchant=matched_merchant)
                     view = ConfirmView(
                         author_id=message.author.id,
                         receipt_data=data,
                         file_hash=file_hash,
                         file_bytes=upload_bytes,
-                        is_pdf=is_pdf
+                        is_pdf=is_pdf,
+                        matched_receipt_id=matched_receipt_id
                     )
                     await processing_msg.edit(content=None, embed=embed, view=view)
 
