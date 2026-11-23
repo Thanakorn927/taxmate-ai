@@ -236,6 +236,8 @@ async def on_ready():
     await bot.tree.sync()
     if not check_recurring_bills.is_running():
         check_recurring_bills.start()
+    if not send_monthly_summary.is_running():
+        send_monthly_summary.start()
     print(f"✅ บอท {bot.user} ออนไลน์แล้ว!")
 
 @bot.tree.command(name="summary", description="สรุปยอดค่าใช้จ่ายและรายการลดหย่อนภาษีของคุณ")
@@ -491,7 +493,93 @@ async def export_zip_command(interaction: discord.Interaction):
         file=file,
         ephemeral=True
     )
+# ฟังก์ชันช่วยสร้าง Embed สรุปสเตทเมนต์รายเดือน
+def build_monthly_embed(title_month: str, records: list) -> discord.Embed:
+    total_spent = sum(float(r["total_amount"]) for r in records)
+    total_tax = sum(float(r["total_amount"]) for r in records if r["is_tax_deductible"])
 
+    by_category = {}
+    for r in records:
+        cat = r.get("category") or "อื่นๆ"
+        by_category[cat] = by_category.get(cat, 0.0) + float(r["total_amount"])
+
+    cat_lines = "\n".join([
+        f"• **{k}**: {v:,.2f} บาท ({(v / total_spent * 100):.1f}%)"
+        for k, v in sorted(by_category.items(), key=lambda x: x[1], reverse=True)
+    ])
+
+    embed = discord.Embed(
+        title=f"📅 สรุปสเตทเมนต์ประจำเดือน {title_month}",
+        description=f"สรุปรายการทั้งหมด **{len(records)} รายการ**",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="💸 ยอดใช้จ่ายรวม", value=f"**{total_spent:,.2f} บาท**", inline=True)
+    embed.add_field(name="🧾 ยอดลดหย่อนภาษีได้", value=f"**{total_tax:,.2f} บาท**", inline=True)
+    embed.add_field(name="📁 สัดส่วนตามหมวดหมู่", value=cat_lines or "-", inline=False)
+    embed.set_footer(text="TaxMate AI • ระบบสรุปสเตทเมนต์รายเดือนอัตโนมัติ")
+    return embed
+
+# ระบบเบื้องหลัง: ส่งสรุปสเตทเมนต์รายเดือนอัตโนมัติ ทุกวันที่ 1 เวลา 09:05 น. (02:05 UTC)
+@tasks.loop(time=time(hour=2, minute=5, tzinfo=timezone.utc))
+async def send_monthly_summary():
+    th_now = datetime.now(timezone(timedelta(hours=7)))
+    if th_now.day != 1:
+        return  # ทำงานเฉพาะวันที่ 1 ของเดือน
+
+    # คำนวณเดือนที่ผ่านมา (รูปแบบ YYYY-MM)
+    last_month_date = th_now.replace(day=1) - timedelta(days=1)
+    target_month = last_month_date.strftime("%Y-%m")
+
+    res = (
+        supabase.table("receipts")
+        .select("*")
+        .gte("transaction_date", f"{target_month}-01")
+        .lte("transaction_date", f"{target_month}-31")
+        .execute()
+    )
+    if not res.data:
+        return
+
+    # จัดกลุ่มตามผู้ใช้
+    user_records = {}
+    user_channel = {}
+    for r in res.data:
+        uid = r["discord_user_id"]
+        user_records.setdefault(uid, []).append(r)
+        if r.get("discord_channel_id"):
+            user_channel[uid] = int(r["discord_channel_id"])
+
+    for uid, records in user_records.items():
+        channel_id = user_channel.get(uid)
+        if not channel_id:
+            continue
+        channel = bot.get_channel(channel_id)
+        if channel:
+            embed = build_monthly_embed(target_month, records)
+            await channel.send(content=f"📊 <@{uid}> สรุปสเตทเมนต์ประจำเดือน **{target_month}** มาแล้วครับ!", embed=embed)
+
+# คำสั่งเรียกดูสรุปสเตทเมนต์รายเดือนได้ทันที (/monthly_report)
+@bot.tree.command(name="monthly_report", description="ดูสรุปสเตทเมนต์รายเดือน (เว้นว่างไว้เพื่อดูเดือนปัจจุบัน)")
+@app_commands.describe(month="ระบุเดือนรูปแบบ YYYY-MM เช่น 2026-11 (ไม่ใส่ = เดือนปัจจุบัน)")
+async def monthly_report_command(interaction: discord.Interaction, month: str = None):
+    await interaction.response.defer(ephemeral=True)
+    th_now = datetime.now(timezone(timedelta(hours=7)))
+    target_month = month.strip() if month else th_now.strftime("%Y-%m")
+
+    res = (
+        supabase.table("receipts")
+        .select("*")
+        .eq("discord_user_id", str(interaction.user.id))
+        .gte("transaction_date", f"{target_month}-01")
+        .lte("transaction_date", f"{target_month}-31")
+        .execute()
+    )
+    if not res.data:
+        await interaction.followup.send(f"📭 ไม่พบข้อมูลบิลในเดือน `{target_month}` ครับ", ephemeral=True)
+        return
+
+    embed = build_monthly_embed(target_month, res.data)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
