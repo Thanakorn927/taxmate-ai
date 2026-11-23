@@ -17,6 +17,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
+import gspread
+from google.oauth2.service_account import Credentials
 
 # 1. โหลดค่า API Keys จากไฟล์ .env
 load_dotenv()
@@ -28,6 +30,43 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 # 2. เชื่อมต่อ Gemini และ Supabase
 client = genai.Client(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ฟังก์ชันซิงก์ข้อมูลลง Google Sheets แบบเรียลไทม์
+def sync_to_google_sheets(record: dict):
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        return
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes)
+        elif os.path.exists("credentials.json"):
+            creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+        else:
+            return
+
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(sheet_id).sheet1
+
+        # ถ้าชีทยังว่าง ให้สร้างหัวตารางให้อัตโนมัติ
+        if not ws.get_all_values():
+            ws.append_row([
+                "วันที่ทำรายการ", "ประเภทเอกสาร", "ร้านค้า / ผู้รับ",
+                "หมวดหมู่", "ยอดเงิน (บาท)", "ลดหย่อนภาษีได้", "ลิงก์เอกสารต้นฉบับ"
+            ])
+
+        ws.append_row([
+            record.get("transaction_date", ""),
+            record.get("doc_type", ""),
+            record.get("merchant_name", ""),
+            record.get("category", ""),
+            float(record.get("total_amount", 0)),
+            "ได้" if record.get("is_tax_deductible") else "ไม่ได้",
+            record.get("image_url", "")
+        ])
+    except Exception as e:
+        print(f"⚠️ Google Sheets Sync Error: {e}")
 
 class ReceiptData(BaseModel):
     doc_type: str = Field(description="ประเภทเอกสาร เช่น สลิปโอนเงิน, ใบเสร็จรับเงิน, ใบกำกับภาษี, e-Donation")
@@ -207,7 +246,8 @@ class ConfirmView(discord.ui.View):
                     "math_verified": self.receipt_data.get("math_verified", True),
                 }
                 supabase.table("receipts").insert(record).execute()
-                footer_text = "✅ บันทึกลงฐานข้อมูลเรียบร้อยแล้ว!"
+                await asyncio.to_thread(sync_to_google_sheets, record)
+                footer_text = "✅ บันทึกลงฐานข้อมูลและซิงก์ Google Sheets เรียบร้อยแล้ว!"
 
             for item in self.children:
                 item.disabled = True
@@ -498,6 +538,7 @@ async def export_zip_command(interaction: discord.Interaction):
         file=file,
         ephemeral=True
     )
+
 # ฟังก์ชันช่วยสร้าง Embed สรุปสเตทเมนต์รายเดือน
 def build_monthly_embed(title_month: str, records: list) -> discord.Embed:
     total_spent = sum(float(r["total_amount"]) for r in records)
@@ -585,8 +626,8 @@ async def monthly_report_command(interaction: discord.Interaction, month: str = 
 
     embed = build_monthly_embed(target_month, res.data)
     await interaction.followup.send(embed=embed, ephemeral=True)
-    # --- เฟส 2: Shared Workspace และโหมดหารบิล ---
 
+# --- เฟส 2: Shared Workspace และโหมดหารบิล ---
 class SplitBillView(discord.ui.View):
     def __init__(self, split_records: list, payer_id: int, note: str, per_person: float):
         super().__init__(timeout=None)
@@ -728,6 +769,7 @@ async def debts_command(interaction: discord.Interaction):
         embed.add_field(name="📤 ยอดที่คุณค้างจ่ายเพื่อน", value="ไม่มีรายการค้าง", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
