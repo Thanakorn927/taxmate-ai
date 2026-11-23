@@ -5,6 +5,10 @@ import csv
 import hashlib
 import uuid
 import asyncio
+import zipfile
+import aiohttp
+from datetime import datetime, time, timezone, timedelta
+from discord.ext import commands, tasks  # ⬅️ แก้บรรทัดเดิมให้เพิ่ม , tasks
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -196,8 +200,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()  # ซิงค์คำสั่ง /summary เข้า Discord
+    await bot.tree.sync()
+    if not check_recurring_bills.is_running():
+        check_recurring_bills.start()
     print(f"✅ บอท {bot.user} ออนไลน์แล้ว!")
+
 
 @bot.tree.command(name="summary", description="สรุปยอดค่าใช้จ่ายและรายการลดหย่อนภาษีของคุณ")
 async def summary_command(interaction: discord.Interaction):
@@ -313,6 +320,149 @@ async def dashboard_command(interaction: discord.Interaction):
     ))
 
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    # --- 1. คำสั่งตั้งค่าแจ้งเตือนบิลประจำ (/remind) ---
+@bot.tree.command(name="remind", description="ตั้งค่าแจ้งเตือนค่าใช้จ่ายประจำทุกเดือน (เช่น ค่าหอ ค่าเน็ต)")
+@app_commands.describe(
+    bill_name="ชื่อรายการ เช่น ค่าหอ, ค่าเน็ต, ค่าบัตรเครดิต",
+    amount="ยอดเงิน (บาท)",
+    due_day="วันที่ต้องจ่ายของทุกเดือน (1-31)"
+)
+async def remind_command(interaction: discord.Interaction, bill_name: str, amount: float, due_day: int):
+    if not (1 <= due_day <= 31):
+        await interaction.response.send_message("❌ กรุณาระบุวันที่ระหว่าง 1 ถึง 31 เท่านั้นครับ", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    record = {
+        "discord_user_id": str(interaction.user.id),
+        "discord_channel_id": str(interaction.channel_id),
+        "bill_name": bill_name.strip(),
+        "amount": amount,
+        "due_day": due_day,
+        "is_active": True
+    }
+    supabase.table("recurring_bills").insert(record).execute()
+
+    embed = discord.Embed(title="⏰ ตั้งค่าแจ้งเตือนบิลประจำสำเร็จ!", color=discord.Color.teal())
+    embed.add_field(name="📌 รายการ", value=bill_name, inline=True)
+    embed.add_field(name="💰 ยอดเงิน", value=f"{amount:,.2f} บาท", inline=True)
+    embed.add_field(name="📅 แจ้งเตือนทุกวันที่", value=f"วันที่ {due_day} ของทุกเดือน (09:00 น.)", inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ระบบเบื้องหลัง: เช็กและแจ้งเตือนบิลประจำทุกวัน เวลา 09:00 น. (02:00 UTC)
+@tasks.loop(time=time(hour=2, minute=0, tzinfo=timezone.utc))
+async def check_recurring_bills():
+    th_now = datetime.now(timezone(timedelta(hours=7)))
+    today_day = th_now.day
+
+    res = (
+        supabase.table("recurring_bills")
+        .select("*")
+        .eq("due_day", today_day)
+        .eq("is_active", True)
+        .execute()
+    )
+    for bill in res.data:
+        channel = bot.get_channel(int(bill["discord_channel_id"]))
+        if channel:
+            embed = discord.Embed(
+                title=f"🔔 แจ้งเตือนครบกำหนดชำระ: {bill['bill_name']}",
+                description=f"ถึงกำหนดจ่ายประจำวันที่ **{today_day}** แล้วครับ อย่าลืมโอนและส่งสลิปมาบันทึกนะ!",
+                color=discord.Color.orange()
+            )
+            embed.add_field(name="💰 ยอดที่ต้องชำระ", value=f"**{float(bill['amount']):,.2f} บาท**", inline=True)
+            await channel.send(content=f"<@{bill['discord_user_id']}>", embed=embed)
+
+# --- 2. คำสั่ง AI วิเคราะห์รายจ่ายและแนะนำลดหย่อนภาษี (/analyze) ---
+@bot.tree.command(name="analyze", description="ให้ AI วิเคราะห์จุดที่ควรลดรายจ่ายและแนะนำสิทธิ์ลดหย่อนภาษี")
+async def analyze_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    user_id = str(interaction.user.id)
+
+    res = (
+        supabase.table("receipts")
+        .select("transaction_date, merchant_name, category, total_amount, is_tax_deductible, doc_type")
+        .eq("discord_user_id", user_id)
+        .order("transaction_date", desc=True)
+        .limit(50)
+        .execute()
+    )
+    records = res.data
+
+    if not records:
+        await interaction.followup.send("📭 ยังไม่มีข้อมูลบิลให้วิเคราะห์ครับ ลองส่งสลิปเข้ามาก่อนนะ", ephemeral=True)
+        return
+
+    summary_text = json.dumps(records, ensure_ascii=False)
+    prompt = (
+        f"คุณคือผู้ช่วยวางแผนการเงินและภาษีส่วนตัว นี่คือรายการค่าใช้จ่ายล่าสุดของผู้ใช้ (JSON):\n{summary_text}\n\n"
+        "กรุณาวิเคราะห์เป็นภาษาไทยแบบกระชับ อ่านง่าย ใช้ Bullet Points ดังนี้:\n"
+        "1. **ภาพรวมและจุดที่ควรลดรายจ่าย:** ชี้หมวดหมู่หรือร้านค้าที่ใช้จ่ายสูงผิดปกติ พร้อมคำแนะนำที่ใช้ได้จริง\n"
+        "2. **คำแนะนำด้านภาษี:** ระบุรายการที่น่าจะขอใบกำกับภาษีเต็มรูป / e-Tax Invoice เพิ่มได้ในอนาคต เพื่อเพิ่มยอดลดหย่อน\n"
+        "3. **คำแนะนำสั้นๆ ปิดท้าย:** 1 ประโยคให้กำลังใจ"
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-3.8-flash",
+            contents=prompt,
+        )
+        embed = discord.Embed(
+            title="🧠 บทวิเคราะห์การเงินและภาษีโดย TaxMate AI",
+            description=response.text[:4000],
+            color=discord.Color.purple()
+        )
+        embed.set_footer(text=f"วิเคราะห์จากข้อมูลล่าสุด {len(records)} รายการ")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ ไม่สามารถวิเคราะห์ได้ในขณะนี้: {e}", ephemeral=True)
+
+# --- 3. คำสั่งส่งออกไฟล์รวมใบกำกับภาษีเป็น ZIP (/export_zip) ---
+@bot.tree.command(name="export_zip", description="ดาวน์โหลดไฟล์รวมเอกสารลดหย่อนภาษีทั้งหมดเป็นไฟล์ ZIP")
+async def export_zip_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    user_id = str(interaction.user.id)
+
+    res = (
+        supabase.table("receipts")
+        .select("transaction_date, merchant_name, total_amount, image_url")
+        .eq("discord_user_id", user_id)
+        .eq("is_tax_deductible", True)
+        .order("transaction_date", desc=True)
+        .execute()
+    )
+    records = res.data
+
+    if not records:
+        await interaction.followup.send("📭 ยังไม่พบเอกสารที่ลดหย่อนภาษีได้ในระบบครับ", ephemeral=True)
+        return
+
+    zip_buffer = io.BytesIO()
+    async with aiohttp.ClientSession() as session:
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for idx, r in enumerate(records, start=1):
+                url = r.get("image_url")
+                if not url:
+                    continue
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            file_bytes = await resp.read()
+                            ext = "pdf" if url.lower().endswith(".pdf") else "jpg"
+                            safe_merchant = "".join(c for c in r.get("merchant_name", "doc") if c.isalnum() or c in " _-ก-๛")[:25]
+                            filename = f"{idx:02d}_{r.get('transaction_date', 'date')}_{safe_merchant}.{ext}"
+                            zf.writestr(filename, file_bytes)
+                except Exception:
+                    continue
+
+    zip_buffer.seek(0)
+    file = discord.File(fp=zip_buffer, filename=f"TaxMate_TaxDocs_{user_id}.zip")
+    await interaction.followup.send(
+        content=f"🗂️ รวมเอกสารลดหย่อนภาษีสำเร็จทั้งหมด **{len(records)} ไฟล์** พร้อมสำหรับยื่นภาษีครับ!",
+        file=file,
+        ephemeral=True
+    )
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
