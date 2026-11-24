@@ -480,7 +480,7 @@ async def analyze_command(interaction: discord.Interaction):
     try:
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-3.8-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
         )
         embed = discord.Embed(
@@ -806,31 +806,39 @@ async def on_message(message):
                         upload_bytes = compress_image(raw_bytes)
                         ai_input = Image.open(io.BytesIO(upload_bytes))
 
+                    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
                     response = None
-                    wait_times = [3, 8]
+                    last_err = None
 
-                    for attempt in range(len(wait_times) + 1):
-                        try:
-                            response = await asyncio.to_thread(
-                                client.models.generate_content,
-                                model="gemini-3.8-flash",
-                                contents=[ai_input, prompt],
-                                config=types.GenerateContentConfig(
-                                    response_mime_type="application/json",
-                                    response_schema=ReceiptData,
-                                    temperature=0.1,
-                                ),
-                            )
-                            break
-                        except Exception as api_err:
-                            if "503" in str(api_err) and attempt < len(wait_times):
-                                delay = wait_times[attempt]
-                                await processing_msg.edit(
-                                    content=f"⏳ เซิร์ฟเวอร์ AI กำลังหนาแน่น กำลังรอคิวและลองใหม่อัตโนมัติใน {delay} วินาที... (ครั้งที่ {attempt + 1}/{len(wait_times)})"
+                    for model_name in models_to_try:
+                        for attempt in range(2):
+                            try:
+                                response = await asyncio.to_thread(
+                                    client.models.generate_content,
+                                    model=model_name,
+                                    contents=[ai_input, prompt],
+                                    config=types.GenerateContentConfig(
+                                        response_mime_type="application/json",
+                                        response_schema=ReceiptData,
+                                        temperature=0.1,
+                                    ),
                                 )
-                                await asyncio.sleep(delay)
-                            else:
-                                raise api_err
+                                break
+                            except Exception as api_err:
+                                last_err = api_err
+                                err_text = str(api_err)
+                                if ("503" in err_text or "429" in err_text) and attempt == 0:
+                                    await processing_msg.edit(
+                                        content=f"⏳ โมเดล `{model_name}` คิวแน่น กำลังลองใหม่อีกครั้งใน 2 วินาที..."
+                                    )
+                                    await asyncio.sleep(2)
+                                else:
+                                    break
+                        if response is not None:
+                            break
+
+                    if response is None:
+                        raise last_err or RuntimeError("ไม่สามารถรับคำตอบจากโมเดล AI ได้")
 
                     data = json.loads(response.text)
 
