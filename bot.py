@@ -770,6 +770,30 @@ async def debts_command(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="sheets", description="เปิดไฟล์ Google Sheets สรุปรายการค่าใช้จ่าย")
+async def sheets_command(interaction: discord.Interaction):
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        await interaction.response.send_message("⚠️ ยังไม่ได้ตั้งค่า `GOOGLE_SHEET_ID` ครับ", ephemeral=True)
+        return
+
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+    embed = discord.Embed(
+        title="📗 TaxMate AI Google Sheets",
+        description="คลิกปุ่มด้านล่างเพื่อเปิดดูข้อมูลรายการค่าใช้จ่ายที่ซิงก์แบบเรียลไทม์ครับ",
+        color=discord.Color.green()
+    )
+
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="เปิด Google Sheets",
+        style=discord.ButtonStyle.link,
+        url=sheet_url,
+        emoji="📊"
+    ))
+
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -832,7 +856,7 @@ async def on_message(message):
                                 if is_overloaded:
                                     await processing_msg.edit(
                                         content=f"⏳ เซิร์ฟเวอร์โมเดล `{model_name}` คิวหนาแน่น กำลังรอและลองใหม่ใน {delay} วินาที... (รอบที่ {attempt}/{len(wait_schedule)})"
-                                )
+                                    )
                                     await asyncio.sleep(delay)
                                 else:
                                     break
