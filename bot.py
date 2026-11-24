@@ -204,6 +204,18 @@ class ConfirmView(discord.ui.View):
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         try:
+            # เช็กกันซ้ำอีกรอบก่อนอัปโหลดและบันทึก (ป้องกันการกดยืนยันซ้ำจากหลายข้อความ)
+            if not self.matched_receipt_id:
+                dup_check = supabase.table("receipts").select("id").eq("image_hash", self.file_hash).limit(1).execute()
+                if dup_check.data:
+                    for item in self.children:
+                        item.disabled = True
+                    embed = interaction.message.embeds[0]
+                    embed.color = discord.Color.orange()
+                    embed.set_footer(text="⚠️ รายการนี้ถูกบันทึกไปแล้ว (ป้องกันการบันทึกซ้ำ)")
+                    await interaction.edit_original_response(embed=embed, view=self)
+                    return
+
             ext = "pdf" if self.is_pdf else "jpg"
             mime = "application/pdf" if self.is_pdf else "image/jpeg"
             folder = "pdf" if self.is_pdf else "image"
