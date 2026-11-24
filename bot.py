@@ -806,12 +806,13 @@ async def on_message(message):
                         upload_bytes = compress_image(raw_bytes)
                         ai_input = Image.open(io.BytesIO(upload_bytes))
 
-                    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+                    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+                    wait_schedule = [2, 4, 6]
                     response = None
                     last_err = None
 
                     for model_name in models_to_try:
-                        for attempt in range(2):
+                        for attempt, delay in enumerate(wait_schedule, start=1):
                             try:
                                 response = await asyncio.to_thread(
                                     client.models.generate_content,
@@ -827,11 +828,12 @@ async def on_message(message):
                             except Exception as api_err:
                                 last_err = api_err
                                 err_text = str(api_err)
-                                if ("503" in err_text or "429" in err_text) and attempt == 0:
+                                is_overloaded = "503" in err_text or "UNAVAILABLE" in err_text or "429" in err_text or "RESOURCE_EXHAUSTED" in err_text
+                                if is_overloaded:
                                     await processing_msg.edit(
-                                        content=f"⏳ โมเดล `{model_name}` คิวแน่น กำลังลองใหม่อีกครั้งใน 2 วินาที..."
-                                    )
-                                    await asyncio.sleep(2)
+                                        content=f"⏳ เซิร์ฟเวอร์โมเดล `{model_name}` คิวหนาแน่น กำลังรอและลองใหม่ใน {delay} วินาที... (รอบที่ {attempt}/{len(wait_schedule)})"
+                                )
+                                    await asyncio.sleep(delay)
                                 else:
                                     break
                         if response is not None:
