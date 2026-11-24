@@ -480,7 +480,7 @@ async def analyze_command(interaction: discord.Interaction):
     try:
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.5-flash",
+            model="gemini-3.5-flash-lite",
             contents=prompt,
         )
         embed = discord.Embed(
@@ -806,7 +806,7 @@ async def on_message(message):
                         upload_bytes = compress_image(raw_bytes)
                         ai_input = Image.open(io.BytesIO(upload_bytes))
 
-                    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+                    models_to_try = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
                     wait_schedule = [2, 4, 6]
                     response = None
                     last_err = None
