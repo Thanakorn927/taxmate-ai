@@ -71,8 +71,37 @@ st.markdown('<p class="sub-header">ระบบติดตามค่าใช
 
 @st.cache_data(ttl=60)
 def load_data():
-    res = supabase.table("receipts").select("*").order("transaction_date", desc=True).execute()
-    return pd.DataFrame(res.data)
+    receipts_res = supabase.table("receipts").select("*").order("transaction_date", desc=True).execute()
+    df_receipts = pd.DataFrame(receipts_res.data)
+
+    # ดึงชื่อ Workspace และชื่อผู้ใช้มาจับคู่
+    ws_map = {}
+    user_map = {}
+    try:
+        ws_res = supabase.table("workspaces").select("id, name").execute()
+        ws_map = {str(w["id"]): w["name"] for w in ws_res.data}
+    except Exception:
+        pass
+
+    try:
+        users_res = supabase.table("users").select("discord_user_id, display_name").execute()
+        user_map = {str(u["discord_user_id"]): u["display_name"] for u in users_res.data}
+    except Exception:
+        pass
+
+    if not df_receipts.empty:
+        if "workspace_id" in df_receipts.columns:
+            df_receipts["workspace_name"] = df_receipts["workspace_id"].apply(
+                lambda x: ws_map.get(str(x), "ส่วนตัว (Personal)") if pd.notna(x) and str(x) != "" else "ส่วนตัว (Personal)"
+            )
+        else:
+            df_receipts["workspace_name"] = "ส่วนตัว (Personal)"
+
+        df_receipts["user_display"] = df_receipts["discord_user_id"].apply(
+            lambda uid: user_map.get(str(uid), f"User #{str(uid)[-4:]}")
+        )
+
+    return df_receipts
 
 # ปุ่มรีเฟรชข้อมูลด้านซ้าย
 with st.sidebar:
@@ -95,6 +124,12 @@ df["transaction_date"] = df["transaction_date_dt"].dt.strftime("%Y-%m-%d")
 # แถบตัวกรองด้านซ้าย (Sidebar)
 with st.sidebar:
     st.divider()
+    workspaces = ["ทั้งหมด"] + sorted(df["workspace_name"].dropna().unique().tolist())
+    selected_ws = st.selectbox("🏠 เลือกพื้นที่ / กองกลาง", workspaces)
+
+    users_list = ["ทั้งหมด"] + sorted(df["user_display"].dropna().unique().tolist())
+    selected_user = st.selectbox("👤 เลือกรายบุคคล", users_list)
+
     search_query = st.text_input("🔎 ค้นหาชื่อร้านค้า / ผู้รับ", placeholder="พิมพ์ชื่อร้านค้า...")
 
     categories = ["ทั้งหมด"] + sorted(df["category"].dropna().unique().tolist())
@@ -111,6 +146,10 @@ with st.sidebar:
 
 # กรองข้อมูลตามเงื่อนไข
 filtered_df = df.copy()
+if selected_ws != "ทั้งหมด":
+    filtered_df = filtered_df[filtered_df["workspace_name"] == selected_ws]
+if selected_user != "ทั้งหมด":
+    filtered_df = filtered_df[filtered_df["user_display"] == selected_user]
 if search_query:
     filtered_df = filtered_df[filtered_df["merchant_name"].str.contains(search_query, case=False, na=False)]
 if selected_cat != "ทั้งหมด":
@@ -142,7 +181,7 @@ st.caption(f"สะสมแล้ว **{total_tax:,.2f} บาท** จาก�
 
 st.divider()
 
-# 3. กราฟแสดงผล (โทนสี Cyber-Blue + พื้นหลังโปร่งใส)
+# 3. กราฟแสดงผลแถวที่ 1 (หมวดหมู่ + รายวัน)
 cyber_palette = ["#00D4FF", "#3B82F6", "#6366F1", "#0EA5E9", "#38BDF8", "#818CF8"]
 chart_col1, chart_col2 = st.columns(2)
 
@@ -177,13 +216,43 @@ with chart_col2:
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             font=dict(family="Bai Jamjuree", color="#E2E8F0"),
-            xaxis=dict(showgrid=False),
+            xaxis=dict(type="category", showgrid=False),
             yaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
             margin=dict(t=20, b=20, l=20, r=20)
         )
         st.plotly_chart(fig_bar, use_container_width=True)
     else:
         st.info("ไม่มีข้อมูลในช่วงที่เลือก")
+
+# 3.1 กราฟแสดงผลแถวที่ 2 (แยกตามรายบุคคล)
+st.subheader("👤 ยอดใช้จ่ายแยกตามรายบุคคล")
+if not filtered_df.empty:
+    user_sum = (
+        filtered_df.groupby("user_display", as_index=False)["total_amount"]
+        .sum()
+        .sort_values("total_amount", ascending=True)
+    )
+    fig_user = px.bar(
+        user_sum,
+        x="total_amount",
+        y="user_display",
+        orientation="h",
+        text_auto=",.2f",
+        labels={"user_display": "ผู้ใช้งาน", "total_amount": "ยอดเงินรวม (บาท)"},
+        color_discrete_sequence=["#3B82F6"]
+    )
+    fig_user.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Bai Jamjuree", color="#E2E8F0"),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
+        yaxis=dict(showgrid=False),
+        margin=dict(t=10, b=20, l=20, r=20),
+        height=max(220, len(user_sum) * 55 + 100)
+    )
+    st.plotly_chart(fig_user, use_container_width=True)
+else:
+    st.info("ไม่มีข้อมูลในช่วงที่เลือก")
 
 st.divider()
 
@@ -193,9 +262,12 @@ with header_col:
     st.subheader("📋 ประวัติเอกสารทั้งหมด")
 with btn_col:
     export_df = filtered_df[[
-        "transaction_date", "doc_type", "merchant_name", "category", "total_amount", "is_tax_deductible", "image_url"
+        "transaction_date", "workspace_name", "user_display", "doc_type",
+        "merchant_name", "category", "total_amount", "is_tax_deductible", "image_url"
     ]].rename(columns={
         "transaction_date": "วันที่ทำรายการ",
+        "workspace_name": "พื้นที่ / กองกลาง",
+        "user_display": "ผู้บันทึก",
         "doc_type": "ประเภทเอกสาร",
         "merchant_name": "ร้านค้า / ผู้รับ",
         "category": "หมวดหมู่",
@@ -213,13 +285,16 @@ with btn_col:
     )
 
 display_df = filtered_df[[
-    "transaction_date", "doc_type", "merchant_name", "category", "total_amount", "is_tax_deductible", "image_url"
+    "transaction_date", "workspace_name", "user_display", "doc_type",
+    "merchant_name", "category", "total_amount", "is_tax_deductible", "image_url"
 ]]
 
 st.dataframe(
     display_df,
     column_config={
         "transaction_date": "วันที่",
+        "workspace_name": "พื้นที่ / กองกลาง",
+        "user_display": "ผู้บันทึก",
         "doc_type": "ประเภท",
         "merchant_name": "ร้านค้า / ผู้รับ",
         "category": "หมวดหมู่",
