@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 from supabase import create_client, Client
 import gspread
 from google.oauth2.service_account import Credentials
+from openpyxl import Workbook
+from fpdf import FPDF
 
 # 1. โหลดค่า API Keys จากไฟล์ .env
 load_dotenv()
@@ -805,6 +807,113 @@ async def sheets_command(interaction: discord.Interaction):
     ))
 
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+@bot.tree.command(name="export_excel", description="ส่งออกรายการค่าใช้จ่ายเป็นไฟล์ Excel (.xlsx)")
+async def export_excel_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    user_id = str(interaction.user.id)
+
+    res = (
+        supabase.table("receipts")
+        .select("*")
+        .eq("discord_user_id", user_id)
+        .order("transaction_date", desc=True)
+        .execute()
+    )
+    records = res.data
+    if not records:
+        await interaction.followup.send("📭 ยังไม่พบข้อมูลบิลของคุณในระบบครับ", ephemeral=True)
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "TaxMate Report"
+    ws.append(["วันที่ทำรายการ", "ประเภทเอกสาร", "ร้านค้า / ผู้รับ", "หมวดหมู่", "ยอดเงิน (บาท)", "ลดหย่อนภาษีได้", "ลิงก์เอกสาร"])
+
+    for r in records:
+        ws.append([
+            r.get("transaction_date", ""),
+            r.get("doc_type", ""),
+            r.get("merchant_name", ""),
+            r.get("category", ""),
+            float(r.get("total_amount", 0)),
+            "ได้" if r.get("is_tax_deductible") else "ไม่ได้",
+            r.get("matched_tax_url") or r.get("image_url", "")
+        ])
+
+    excel_buffer = io.BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+
+    file = discord.File(fp=excel_buffer, filename=f"TaxMate_Report_{user_id}.xlsx")
+    await interaction.followup.send(
+        content=f"📗 ส่งออกไฟล์ Excel สำเร็จทั้งหมด **{len(records)} รายการ** ครับ!",
+        file=file,
+        ephemeral=True
+    )
+
+@bot.tree.command(name="export_pdf", description="ส่งออกรายงานสรุปค่าใช้จ่ายเป็นไฟล์ PDF")
+async def export_pdf_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    user_id = str(interaction.user.id)
+
+    res = (
+        supabase.table("receipts")
+        .select("*")
+        .eq("discord_user_id", user_id)
+        .order("transaction_date", desc=True)
+        .execute()
+    )
+    records = res.data
+    if not records:
+        await interaction.followup.send("📭 ยังไม่พบข้อมูลบิลของคุณในระบบครับ", ephemeral=True)
+        return
+
+    total_spent = sum(float(r["total_amount"]) for r in records)
+    total_tax = sum(float(r["total_amount"]) for r in records if r["is_tax_deductible"])
+
+    pdf = FPDF()
+    pdf.add_page()
+
+    font_path = "thai_font.ttf"
+    if os.path.exists(font_path):
+        pdf.add_font("ThaiFont", "", font_path)
+        pdf.set_font("ThaiFont", size=16)
+    else:
+        pdf.set_font("Helvetica", size=14)
+
+    pdf.cell(0, 10, "TaxMate AI - รายงานสรุปค่าใช้จ่ายและภาษี", ln=True, align="C")
+    pdf.set_font_size(12)
+    pdf.cell(0, 8, f"ผู้ใช้: {interaction.user.display_name} | จำนวนทั้งหมด: {len(records)} รายการ", ln=True)
+    pdf.cell(0, 8, f"ยอดใช้จ่ายรวม: {total_spent:,.2f} บาท | ลดหย่อนภาษีได้: {total_tax:,.2f} บาท", ln=True)
+    pdf.ln(4)
+
+    # หัวตาราง
+    pdf.set_font_size(10)
+    pdf.cell(28, 8, "วันที่", border=1)
+    pdf.cell(62, 8, "ร้านค้า / ผู้รับ", border=1)
+    pdf.cell(40, 8, "หมวดหมู่", border=1)
+    pdf.cell(30, 8, "ยอดเงิน (บาท)", border=1, align="R")
+    pdf.cell(30, 8, "ลดหย่อนภาษี", border=1, align="C", ln=True)
+
+    # รายการ
+    for r in records:
+        merchant = str(r.get("merchant_name", ""))[:26]
+        cat = str(r.get("category", ""))[:18]
+        tax_text = "ได้" if r.get("is_tax_deductible") else "ไม่ได้"
+        pdf.cell(28, 7, str(r.get("transaction_date", "")), border=1)
+        pdf.cell(62, 7, merchant, border=1)
+        pdf.cell(40, 7, cat, border=1)
+        pdf.cell(30, 7, f"{float(r.get('total_amount', 0)):,.2f}", border=1, align="R")
+        pdf.cell(30, 7, tax_text, border=1, align="C", ln=True)
+
+    pdf_bytes = io.BytesIO(pdf.output())
+    file = discord.File(fp=pdf_bytes, filename=f"TaxMate_Report_{user_id}.pdf")
+    await interaction.followup.send(
+        content=f"📄 ส่งออกรายงาน PDF สำเร็จทั้งหมด **{len(records)} รายการ** ครับ!",
+        file=file,
+        ephemeral=True
+    )    
 
 @bot.event
 async def on_message(message):
