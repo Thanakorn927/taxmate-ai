@@ -80,6 +80,10 @@ class ReceiptData(BaseModel):
     confidence_score: int = Field(description="คะแนนความมั่นใจในการอ่านตัวเลข 0-100")
     math_verified: bool = Field(description="ตรวจสอบยอดรวมคณิตศาสตร์บนบิลว่าถูกต้องหรือไม่ (ถ้าไม่มีรายการย่อยให้เป็น True)")
 
+class MultiReceiptResponse(BaseModel):
+    receipts: list[ReceiptData] = Field(description="รายการใบเสร็จ/สลิปที่สมบูรณ์ทั้งหมดในภาพ (ตัดใบที่ขอบแหว่งหรือข้อมูลไม่ครบออก)")
+    ignored_incomplete_count: int = Field(default=0, description="จำนวนบิลที่ขอบแหว่ง/ขาด/อ่านไม่ได้ซึ่งถูกตัดออกอัตโนมัติ")
+
 # ฟังก์ชันบีบอัดรูปภาพ
 def compress_image(image_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(image_bytes))
@@ -283,6 +287,113 @@ class ConfirmView(discord.ui.View):
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.light_gray()
         embed.set_footer(text="❌ ยกเลิกรายการนี้แล้ว (ไม่ถูกบันทึก)")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+class MultiSlipPickerView(discord.ui.View):
+    def __init__(self, author_id: int, receipts: list[dict], file_hash: str, file_bytes: bytes, is_pdf: bool):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.receipts = receipts
+        self.file_hash = file_hash
+        self.file_bytes = file_bytes
+        self.is_pdf = is_pdf
+        self.selected_indices = list(range(len(receipts)))
+
+        options = []
+        for idx, r in enumerate(receipts[:25]):
+            label = f"{idx + 1}. {str(r['merchant_name'])[:40]}"
+            desc = f"{float(r['total_amount']):,.2f} บาท | {r['date']} | {r['category']}"
+            options.append(discord.SelectOption(label=label, description=desc[:100], value=str(idx)))
+
+        self.select_menu = discord.ui.Select(
+            placeholder="เลือกบิลที่ต้องการบันทึก (เลือกได้หลายใบ)...",
+            min_values=1,
+            max_values=len(options),
+            options=options
+        )
+        self.select_menu.callback = self.on_select
+        self.add_item(self.select_menu)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("⚠️ เฉพาะผู้ที่ส่งเอกสารนี้เท่านั้นที่สามารถกดปุ่มได้", ephemeral=True)
+            return False
+        return True
+
+    async def on_select(self, interaction: discord.Interaction):
+        self.selected_indices = [int(v) for v in self.select_menu.values]
+        picked_names = ", ".join([f"#{i + 1} {self.receipts[i]['merchant_name']}" for i in self.selected_indices])
+        await interaction.response.send_message(f"📌 เลือกแล้ว **{len(self.selected_indices)} รายการ**: {picked_names}", ephemeral=True)
+
+    async def _save_indices(self, interaction: discord.Interaction, indices: list[int]):
+        await interaction.response.defer()
+        try:
+            ext = "pdf" if self.is_pdf else "jpg"
+            mime = "application/pdf" if self.is_pdf else "image/jpeg"
+            folder = "pdf" if self.is_pdf else "image"
+            file_path = f"{folder}/{self.author_id}_{uuid.uuid4()}.{ext}"
+
+            supabase.storage.from_("receipts").upload(
+                path=file_path,
+                file=self.file_bytes,
+                file_options={"content-type": mime}
+            )
+            file_url = supabase.storage.from_("receipts").get_public_url(file_path)
+
+            ws_res = supabase.table("workspaces").select("id").eq("discord_channel_id", str(interaction.channel_id)).limit(1).execute()
+            workspace_id = ws_res.data[0]["id"] if ws_res.data else None
+
+            saved_count = 0
+            for idx in indices:
+                r = self.receipts[idx]
+                item_hash = f"{self.file_hash}_{idx}"
+                dup_check = supabase.table("receipts").select("id").eq("image_hash", item_hash).limit(1).execute()
+                if dup_check.data:
+                    continue
+
+                record = {
+                    "discord_user_id": str(self.author_id),
+                    "discord_channel_id": str(interaction.channel_id),
+                    "workspace_id": workspace_id,
+                    "image_hash": item_hash,
+                    "image_url": file_url,
+                    "doc_type": r["doc_type"],
+                    "merchant_name": r["merchant_name"],
+                    "transaction_date": r["date"],
+                    "total_amount": r["total_amount"],
+                    "category": r["category"],
+                    "is_tax_deductible": r["is_tax_deductible"],
+                    "confidence_score": r["confidence_score"],
+                    "math_verified": r.get("math_verified", True),
+                }
+                supabase.table("receipts").insert(record).execute()
+                await asyncio.to_thread(sync_to_google_sheets, record)
+                saved_count += 1
+
+            for item in self.children:
+                item.disabled = True
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.blue()
+            embed.set_footer(text=f"✅ บันทึกสำเร็จ {saved_count} รายการ และซิงก์ Google Sheets เรียบร้อยแล้ว!")
+            await interaction.edit_original_response(embed=embed, view=self)
+        except Exception as e:
+            await interaction.followup.send(f"❌ บันทึกข้อมูลไม่สำเร็จ: {e}", ephemeral=True)
+
+    @discord.ui.button(label="บันทึกใบที่เลือก", style=discord.ButtonStyle.green, emoji="✅")
+    async def save_selected_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._save_indices(interaction, self.selected_indices)
+
+    @discord.ui.button(label="บันทึกทั้งหมด", style=discord.ButtonStyle.blurple, emoji="💾")
+    async def save_all_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._save_indices(interaction, list(range(len(self.receipts))))
+
+    @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.red, emoji="❌")
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.light_gray()
+        embed.set_footer(text="❌ ยกเลิกรายการทั้งหมดแล้ว")
         await interaction.response.edit_message(embed=embed, view=self)
 
 # 5. ตั้งค่า Discord Bot และ Slash Commands
@@ -807,7 +918,7 @@ async def sheets_command(interaction: discord.Interaction):
     ))
 
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-    
+
 @bot.tree.command(name="export_excel", description="ส่งออกรายการค่าใช้จ่ายเป็นไฟล์ Excel (.xlsx)")
 async def export_excel_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -913,7 +1024,7 @@ async def export_pdf_command(interaction: discord.Interaction):
         content=f"📄 ส่งออกรายงาน PDF สำเร็จทั้งหมด **{len(records)} รายการ** ครับ!",
         file=file,
         ephemeral=True
-    )    
+    )
 
 @bot.event
 async def on_message(message):
@@ -937,11 +1048,16 @@ async def on_message(message):
                         await processing_msg.edit(content="⚠️ **ตรวจพบเอกสารซ้ำ!** เอกสารฉบับนี้เคยถูกบันทึกเข้าระบบไปแล้วครับ")
                         continue
 
+                    user_instruction = message.content.strip()
+                    instruction_note = f"\nคำสั่งเพิ่มเติมจากผู้ใช้: '{user_instruction}' (ให้คัดเลือกเฉพาะบิลที่ตรงกับคำสั่งนี้)" if user_instruction else ""
+
                     prompt = (
-                        "วิเคราะห์เอกสารทางการเงินนี้ สกัดข้อมูลให้ถูกต้องตามโครงสร้าง "
+                        "วิเคราะห์เอกสารทางการเงินในภาพนี้ หากมีหลายบิล/หลายสลิปในภาพเดียวกันให้แยกสกัดข้อมูลออกมาเป็นรายการใน receipts "
+                        "ให้ตัดบิลที่ขอบแหว่ง ขาด หรืออ่านยอดเงินไม่ได้ออกอัตโนมัติ แล้วนับจำนวนที่ตัดออกไว้ใน ignored_incomplete_count "
                         "หากเป็นใบกำกับภาษีเต็มรูป e-Tax Invoice หรือ e-Donation ให้ตั้งค่า is_tax_deductible เป็น True "
                         "ตรวจสอบผลรวมคณิตศาสตร์ของรายการสินค้า/VAT/ส่วนลดกับยอดสุทธิ หากไม่ตรงให้ตั้ง math_verified เป็น False "
                         "หากตัวเลขจางหรืออ่านยากให้ลดคะแนน confidence_score ตามความเป็นจริง"
+                        f"{instruction_note}"
                     )
 
                     if is_pdf:
@@ -965,7 +1081,7 @@ async def on_message(message):
                                     contents=[ai_input, prompt],
                                     config=types.GenerateContentConfig(
                                         response_mime_type="application/json",
-                                        response_schema=ReceiptData,
+                                        response_schema=MultiReceiptResponse,
                                         temperature=0.1,
                                     ),
                                 )
@@ -987,36 +1103,66 @@ async def on_message(message):
                     if response is None:
                         raise last_err or RuntimeError("ไม่สามารถรับคำตอบจากโมเดล AI ได้")
 
-                    data = json.loads(response.text)
+                    parsed = json.loads(response.text)
+                    receipts_list = parsed.get("receipts", [])
+                    ignored_count = parsed.get("ignored_incomplete_count", 0)
 
-                    # ตรวจสอบว่ามีสลิปเดิมที่วันและยอดเงินตรงกันหรือไม่ (กรณีส่งใบกำกับภาษีตามมาทีหลัง)
-                    matched_receipt_id = None
-                    matched_merchant = None
-                    if data.get("is_tax_deductible"):
-                        match_res = (
-                            supabase.table("receipts")
-                            .select("id, merchant_name")
-                            .eq("discord_user_id", str(message.author.id))
-                            .eq("transaction_date", data["date"])
-                            .eq("total_amount", data["total_amount"])
-                            .eq("is_tax_deductible", False)
-                            .limit(1)
-                            .execute()
+                    if not receipts_list:
+                        await processing_msg.edit(content="⚠️ ไม่พบบิลที่สมบูรณ์ในภาพนี้ (อาจขอบแหว่งหรืออ่านยอดเงินไม่ได้ครับ)")
+                        continue
+
+                    if len(receipts_list) == 1:
+                        data = receipts_list[0]
+                        matched_receipt_id = None
+                        matched_merchant = None
+                        if data.get("is_tax_deductible"):
+                            match_res = (
+                                supabase.table("receipts")
+                                .select("id, merchant_name")
+                                .eq("discord_user_id", str(message.author.id))
+                                .eq("transaction_date", data["date"])
+                                .eq("total_amount", data["total_amount"])
+                                .eq("is_tax_deductible", False)
+                                .limit(1)
+                                .execute()
+                            )
+                            if match_res.data:
+                                matched_receipt_id = match_res.data[0]["id"]
+                                matched_merchant = match_res.data[0]["merchant_name"]
+
+                        embed = build_receipt_embed(data, matched_merchant=matched_merchant)
+                        view = ConfirmView(
+                            author_id=message.author.id,
+                            receipt_data=data,
+                            file_hash=file_hash,
+                            file_bytes=upload_bytes,
+                            is_pdf=is_pdf,
+                            matched_receipt_id=matched_receipt_id
                         )
-                        if match_res.data:
-                            matched_receipt_id = match_res.data[0]["id"]
-                            matched_merchant = match_res.data[0]["merchant_name"]
+                        await processing_msg.edit(content=None, embed=embed, view=view)
+                    else:
+                        lines = [
+                            f"**{idx + 1}. {r['merchant_name']}** — `{float(r['total_amount']):,.2f} บาท` ({r['date']} | {r['category']}) {'🧾' if r['is_tax_deductible'] else ''}"
+                            for idx, r in enumerate(receipts_list)
+                        ]
+                        desc = "\n".join(lines)
+                        if ignored_count > 0:
+                            desc += f"\n\n✂️ *ตัดบิลที่ขอบแหว่ง/ไม่สมบูรณ์ออกอัตโนมัติ {ignored_count} ใบ*"
 
-                    embed = build_receipt_embed(data, matched_merchant=matched_merchant)
-                    view = ConfirmView(
-                        author_id=message.author.id,
-                        receipt_data=data,
-                        file_hash=file_hash,
-                        file_bytes=upload_bytes,
-                        is_pdf=is_pdf,
-                        matched_receipt_id=matched_receipt_id
-                    )
-                    await processing_msg.edit(content=None, embed=embed, view=view)
+                        embed = discord.Embed(
+                            title=f"🗂️ พบเอกสารทั้งหมด {len(receipts_list)} รายการในภาพเดียว",
+                            description=desc,
+                            color=discord.Color.gold()
+                        )
+                        embed.set_footer(text="เลือกบิลจากเมนูด้านล่างแล้วกด [บันทึกใบที่เลือก] หรือกด [บันทึกทั้งหมด]")
+                        view = MultiSlipPickerView(
+                            author_id=message.author.id,
+                            receipts=receipts_list,
+                            file_hash=file_hash,
+                            file_bytes=upload_bytes,
+                            is_pdf=is_pdf
+                        )
+                        await processing_msg.edit(content=None, embed=embed, view=view)
 
                 except Exception as e:
                     await processing_msg.edit(content=f"❌ เกิดข้อผิดพลาด: {e}")
