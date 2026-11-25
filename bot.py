@@ -986,10 +986,15 @@ async def export_pdf_command(interaction: discord.Interaction):
     pdf = FPDF()
     pdf.add_page()
 
-    font_path = "thai_font.ttf"
-    if os.path.exists(font_path):
-        pdf.add_font("ThaiFont", "", font_path)
-        pdf.set_font("ThaiFont", size=16)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    regular_font = os.path.join(base_dir, "thai_font", "Sarabun-Regular.ttf")
+    bold_font = os.path.join(base_dir, "thai_font", "Sarabun-Bold.ttf")
+
+    if os.path.isfile(regular_font):
+        pdf.add_font("Sarabun", "", regular_font)
+        if os.path.isfile(bold_font):
+            pdf.add_font("Sarabun", "B", bold_font)
+        pdf.set_font("Sarabun", size=16)
     else:
         pdf.set_font("Helvetica", size=14)
 
